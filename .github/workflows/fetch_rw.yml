@@ -24,7 +24,7 @@ jobs:
       - name: Checkout Repo
         uses: actions/checkout@v7
         with:
-          token: ${{ secrets.LIVE_PAT }}
+          token: ${{ secrets.VII_PAT }}
 
       - name: Setup Python
         uses: actions/setup-python@v7
