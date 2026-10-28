@@ -1,0 +1,149 @@
+name: Fetch Radarsumme 24h and Generate Binary
+
+on:
+  workflow_dispatch:
+
+env:
+  RW_HOURS: "24"
+  RW_BASE_URL: "https://opendata.dwd.de/weather/radar/radolan/rw"
+  RW_DIR: "data/radarsumme"
+  R2_PREFIX: radarsumme
+  OUT_NAME: radarsumme_latest
+
+jobs:
+  fetch_generate_deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15 # Sicherheitsnetz, falls die Datei nie erscheint
+
+    # verhindert, dass zwei Laeufe gleichzeitig dieselbe Datei generieren/hochladen
+    concurrency:
+      group: fetch-radarsumme
+      cancel-in-progress: false
+
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v7
+        with:
+          token: ${{ secrets.LIVE_PAT }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Cache Python packages
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Set RUN and DATE (aktuelle volle Stunde, UTC)
+        id: set_run_date
+        run: |
+          # Neueste Datei: immer die aktuelle volle Stunde UTC.
+          # Beispiele: 12:16 -> 12:00 | 21:59 -> 21:00
+          NOW=$(date -u +%s)
+          SLOT_EPOCH=$(( (NOW / 3600) * 3600 ))
+
+          TIME=$(date -u -d "@$SLOT_EPOCH" +%H%M)
+          DATE=$(date -u -d "@$SLOT_EPOCH" +%Y%m%d)
+          STAMP=$(date -u -d "@$SLOT_EPOCH" +%y%m%d%H%M)   # DWD-Dateiname: YYMMDDHHMM
+
+          echo "TIME=$TIME" >> $GITHUB_ENV
+          echo "DATE=$DATE" >> $GITHUB_ENV
+          echo "STAMP=$STAMP" >> $GITHUB_ENV
+          echo "SLOT_EPOCH=$SLOT_EPOCH" >> $GITHUB_ENV
+          echo "run=${DATE}_${TIME}" >> $GITHUB_OUTPUT
+
+          echo "[rw24] Datenslot UTC: ${DATE}_${TIME}"
+
+      - name: Download 24 RW-Stundendateien (mit Retry)
+        run: |
+          MAX_ATTEMPTS=50
+          SLEEP_SECONDS=5
+
+          mkdir -p "$RW_DIR"
+          rm -f "$RW_DIR"/raa01-rw_10000-*-dwd---bin.hdf5   # nur die 24 aktuellen Dateien behalten
+
+          fetch() {   # $1 = Dateiname; 0 = ok, 1 = nicht verfuegbar
+            local name="$1" tmp="${RUNNER_TEMP}/$1" code
+            code=$(curl -s -o "$tmp" -w "%{http_code}" \
+              --connect-timeout 10 --max-time 120 \
+              "${RW_BASE_URL}/${name}" || echo "000")
+            if [ "$code" = "200" ] && [ -s "$tmp" ]; then
+              mv "$tmp" "${RW_DIR}/${name}"
+              return 0
+            fi
+            rm -f "$tmp"
+            LAST_CODE="$code"
+            return 1
+          }
+
+          name_for() { echo "raa01-rw_10000-$(date -u -d @"$1" +%y%m%d%H%M)-dwd---bin.hdf5"; }
+
+          # 1) Neueste Datei: Pflicht, mit Wiederholung (kann noch nicht hochgeladen sein)
+          LATEST_NAME="raa01-rw_10000-${STAMP}-dwd---bin.hdf5"
+          ok=0
+          for i in $(seq 1 "$MAX_ATTEMPTS"); do
+            if fetch "$LATEST_NAME"; then
+              echo "[rw24] Neueste Datei geladen (Versuch $i/$MAX_ATTEMPTS): $LATEST_NAME"
+              ok=1
+              break
+            fi
+            echo "[rw24] Versuch $i/$MAX_ATTEMPTS: Datei noch nicht verfuegbar (HTTP $LAST_CODE)."
+            sleep "$SLEEP_SECONDS"
+          done
+          if [ "$ok" != "1" ]; then
+            echo "::error::[rw24] ${LATEST_NAME} nach $MAX_ATTEMPTS Versuchen nicht verfuegbar - Abbruch."
+            exit 1
+          fi
+
+          # 2) Die 23 Stunden davor: 2 Versuche, fehlende werden nur gemeldet
+          missing=""
+          for k in $(seq 1 $(( RW_HOURS - 1 ))); do
+            name=$(name_for $(( SLOT_EPOCH - k * 3600 )))
+            if fetch "$name" || { sleep 3; fetch "$name"; }; then
+              :
+            else
+              echo "::warning::[rw24] ${name} nicht verfuegbar (HTTP $LAST_CODE)."
+              missing="$missing $name"
+            fi
+          done
+
+          count=$(ls "$RW_DIR"/raa01-rw_10000-*-dwd---bin.hdf5 | wc -l)
+          echo "[rw24] Geladen: $count von $RW_HOURS Dateien."
+          [ -z "$missing" ] || echo "[rw24] Fehlend:$missing"
+
+      - name: Generate radarsumme_latest
+        run: python scripts/bin_rw.py
+
+      - name: Gzip der Binaerdatei
+        run: |
+          f="output/radarsumme24h/${OUT_NAME}"
+          gzip -9 -n -c "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+
+      - name: Upload radarsumme_latest zu R2 (mit Retry)
+        run: |
+          MAX_ATTEMPTS=3
+          for i in $(seq 1 "$MAX_ATTEMPTS"); do
+            if aws s3 cp \
+                "output/radarsumme24h/${OUT_NAME}" \
+                "s3://${{ secrets.R2_BUCKET }}/${R2_PREFIX}/${OUT_NAME}" \
+                --content-type application/gzip \
+                --endpoint-url https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com; then
+              echo "[rw24] Upload erfolgreich (Versuch $i/$MAX_ATTEMPTS)."
+              exit 0
+            fi
+            echo "[rw24] Upload fehlgeschlagen (Versuch $i/$MAX_ATTEMPTS), warte 10s..."
+            sleep 10
+          done
+          echo "::error::[rw24] Upload nach $MAX_ATTEMPTS Versuchen fehlgeschlagen."
+          exit 1
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
