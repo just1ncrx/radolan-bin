@@ -53,14 +53,16 @@ jobs:
           TIME=$(date -u -d "@$SLOT_EPOCH" +%H%M)
           DATE=$(date -u -d "@$SLOT_EPOCH" +%Y%m%d)
           STAMP=$(date -u -d "@$SLOT_EPOCH" +%y%m%d%H%M)   # DWD-Dateiname: YYMMDDHHMM
+          DATA_TIME=$(date -u -d "@$SLOT_EPOCH" +%Y-%m-%dT%H:%M:%SZ)   # Ende der letzten Stunde
 
           echo "TIME=$TIME" >> $GITHUB_ENV
           echo "DATE=$DATE" >> $GITHUB_ENV
           echo "STAMP=$STAMP" >> $GITHUB_ENV
           echo "SLOT_EPOCH=$SLOT_EPOCH" >> $GITHUB_ENV
+          echo "DATA_TIME=$DATA_TIME" >> $GITHUB_ENV
           echo "run=${DATE}_${TIME}" >> $GITHUB_OUTPUT
 
-          echo "[rw24] Datenslot UTC: ${DATE}_${TIME}"
+          echo "[rw24] Datenslot UTC: ${DATE}_${TIME} (data_time=${DATA_TIME})"
 
       - name: Download 24 RW-Stundendateien (mit Retry)
         run: |
@@ -122,10 +124,7 @@ jobs:
       - name: Generate radarsumme_latest
         run: python scripts/bin_rw.py
 
-      - name: Gzip der Binaerdatei
-        run: |
-          f="output/radarsumme24h/${OUT_NAME}"
-          gzip -9 -n -c "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+      # KEIN gzip: der Worker liest per Range-Read direkt an Byte-Offsets.
 
       - name: Upload radarsumme_latest zu R2 (mit Retry)
         run: |
@@ -134,9 +133,10 @@ jobs:
             if aws s3 cp \
                 "output/radarsumme24h/${OUT_NAME}" \
                 "s3://${{ secrets.R2_BUCKET }}/${R2_PREFIX}/${OUT_NAME}" \
-                --content-type application/gzip \
+                --content-type application/octet-stream \
+                --metadata "data_time=${DATA_TIME}" \
                 --endpoint-url https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com; then
-              echo "[rw24] Upload erfolgreich (Versuch $i/$MAX_ATTEMPTS)."
+              echo "[rw24] Upload erfolgreich (Versuch $i/$MAX_ATTEMPTS), data_time=${DATA_TIME}."
               exit 0
             fi
             echo "[rw24] Upload fehlgeschlagen (Versuch $i/$MAX_ATTEMPTS), warte 10s..."
