@@ -1,7 +1,6 @@
 name: Cleanup Old Workflow Runs
 
 on:
-  workflow_dispatch:
   workflow_run:
     workflows: ["Fetch Radarsumme 24h and Generate Binary"] # oder "*" für alle Workflows
     types:
